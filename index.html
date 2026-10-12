@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Acoustic-Mesh: Web FSK Modem</title>
+    <style>
+        body { font-family: 'Courier New', Courier, monospace; background-color: #0d1117; color: #58a6ff; text-align: center; padding: 20px; }
+        h1 { color: #00ff9d; text-shadow: 0 0 10px rgba(0,255,157,0.5); }
+        .container { display: flex; flex-direction: column; gap: 20px; max-width: 600px; margin: auto; }
+        .panel { border: 1px solid #30363d; padding: 20px; border-radius: 8px; background: #161b22; }
+        button { background-color: #238636; color: white; border: none; padding: 15px 20px; font-size: 16px; font-weight: bold; cursor: pointer; border-radius: 5px; margin: 5px; }
+        button:hover { background-color: #2ea043; }
+        button.stop { background-color: #da3633; }
+        input { width: 80%; padding: 10px; margin-bottom: 10px; background: #010409; color: #00ff9d; border: 1px solid #30363d; font-family: monospace; font-size: 16px;}
+        #rx-console { background: #010409; color: #00ff9d; height: 150px; overflow-y: auto; text-align: left; padding: 10px; border: 1px solid #30363d; margin-top: 10px; }
+        .blink { animation: blinker 1s linear infinite; }
+        @keyframes blinker { 50% { opacity: 0; } }
+    </style>
+</head>
+<body>
+
+    <h1>🔊 Acoustic-Mesh Modem</h1>
+    <p>Layer 1-3 Air-Gapped Audio Network (Audible FSK)</p>
+
+    <div class="container">
+        <!-- SENDER PANEL -->
+        <div class="panel">
+            <h2 style="color: #ff7b72;">📡 Sender Mode (Node A)</h2>
+            <input type="text" id="payload" value="HELLO" maxlength="10" placeholder="Enter short text (max 10 chars)">
+            <br>
+            <button onclick="transmitPacket()">Transmit Data</button>
+        </div>
+
+        <!-- RECEIVER PANEL -->
+        <div class="panel">
+            <h2 style="color: #79c0ff;">🎧 Receiver Mode (Node B)</h2>
+            <button id="btn-listen" onclick="startListening()">Start Listening</button>
+            <button class="stop" onclick="stopListening()">Stop</button>
+            <div id="rx-status" style="margin-top:10px; color: yellow;">Status: Idle</div>
+            <div id="rx-console">Waiting for audio packets...<br></div>
+        </div>
+    </div>
+
+    <script>
+        // --- ACOUSTIC PROTOCOL CONSTANTS (Audible Range) ---
+        const FREQ_SYNC = 3000; // Preamble/Sync Tone (3 kHz)
+        const FREQ_1    = 2000; // Bit 1 (2 kHz)
+        const FREQ_0    = 1000; // Bit 0 (1 kHz)
+        const BIT_TIME  = 150;  // Duration of each bit in milliseconds (Slow for reliability)
+
+        let audioCtx;
+
+        // ========================================================
+        // SENDER: MODULATION & OSI ENCAPSULATION
+        // ========================================================
+        async function transmitPacket() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const text = document.getElementById('payload').value;
+            
+            // Layer 3: Network Encapsulation [SRC=1, DST=2, PAYLOAD]
+            const packet = `12${text}`; 
+            
+            // Layer 2: Framing (Convert to binary string)
+            let binaryString = "";
+            for (let i = 0; i < packet.length; i++) {
+                let bin = packet.charCodeAt(i).toString(2).padStart(8, '0');
+                binaryString += bin;
+            }
+
+            console.log("Transmitting Baseband Binary:", binaryString);
+
+            // Layer 1: Physical FSK Modulation
+            const osc = audioCtx.createOscillator();
+            osc.type = 'sine'; // Pure tone
+            osc.connect(audioCtx.destination);
+            
+            let currentTime = audioCtx.currentTime;
+            
+            // 1. Send Preamble/Sync (Hold for 3x bit time to wake up receiver)
+            osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
+            currentTime += (BIT_TIME * 3) / 1000;
+
+            // 2. Modulate Data (FSK)
+            for (let i = 0; i < binaryString.length; i++) {
+                const bit = binaryString[i];
+                const freq = (bit === '1') ? FREQ_1 : FREQ_0;
+                osc.frequency.setValueAtTime(freq, currentTime);
+                currentTime += BIT_TIME / 1000;
+            }
+
+            // 3. Stop transmission
+            osc.start();
+            osc.stop(currentTime);
+        }
+
+        // ========================================================
+        // RECEIVER: DEMODULATION & DSP (Fast Fourier Transform)
+        // ========================================================
+        let analyser, microphone, rxInterval;
+        let isReceiving = false;
+        let receivedBits = "";
+        let recordingState = "IDLE"; // IDLE -> SYNC -> RECEIVING
+
+        async function startListening() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
+            
+            try {
+                // Request Microphone access
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                microphone = audioCtx.createMediaStreamSource(stream);
+                analyser = audioCtx.createAnalyser();
+                
+                // FFT Setup
+                analyser.fftSize = 2048; 
+                microphone.connect(analyser);
+                
+                const bufferLength = analyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+                const sampleRate = audioCtx.sampleRate; // usually 44100 or 48000
+                
+                // DSP Polling Loop
+                rxInterval = setInterval(() => {
+                    analyser.getByteFrequencyData(dataArray);
+                    
+                    // Find Dominant Frequency
+                    let maxIndex = 0;
+                    let maxVol = 0;
+                    for(let i = 0; i < bufferLength; i++) {
+                        if(dataArray[i] > maxVol) {
+                            maxVol = dataArray[i];
+                            maxIndex = i;
+                        }
+                    }
+                    
+                    const dominantFreq = maxIndex * sampleRate / analyser.fftSize;
+                    
+                    // Simple threshold logic for Web Demo
+                    if (maxVol > 150) { 
+                        handleFrequency(dominantFreq);
+                    }
+                }, BIT_TIME / 2); // Oversample for better accuracy
+
+            } catch (err) {
+                alert("Microphone access denied or not available. (Use HTTPS or localhost)");
+            }
+        }
+
+        function handleFrequency(freq) {
+            // Frequency tolerance window (+/- 200 Hz)
+            const isSync = Math.abs(freq - FREQ_SYNC) < 200;
+            const isOne  = Math.abs(freq - FREQ_1) < 200;
+            const isZero = Math.abs(freq - FREQ_0) < 200;
+
+            if (recordingState === "IDLE" && isSync) {
+                recordingState = "SYNC";
+                receivedBits = "";
+                document.getElementById('rx-status').innerText = "Status: Locked! Receiving Data... 🔴";
+                logConsole("--- Carrier Detected ---");
+                
+                // Wait for sync tone to finish before reading bits
+                setTimeout(() => { recordingState = "RECEIVING"; }, BIT_TIME * 2);
+            } 
+            else if (recordingState === "RECEIVING") {
+                if (isOne && !receivedBits.endsWith("1_temp")) {
+                    receivedBits += "1";
+                    logConsole("Bit received: 1");
+                } else if (isZero && !receivedBits.endsWith("0_temp")) {
+                    receivedBits += "0";
+                    logConsole("Bit received: 0");
+                }
+                
+                // Assuming standard demo payload size (2 headers + 5 chars) * 8 bits = 56 bits
+                // For a dynamic project, you'd implement a stop bit or length header
+                if (receivedBits.length >= 56) {
+                    processPacket(receivedBits);
+                    recordingState = "IDLE";
+                    document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
+                }
+            }
+        }
+
+        function processPacket(bits) {
+            logConsole("Raw bits: " + bits.substring(0, 56));
+            let ascii = "";
+            for (let i = 0; i < 56; i += 8) {
+                let byte = bits.substring(i, i + 8);
+                ascii += String.fromCharCode(parseInt(byte, 2));
+            }
+            
+            // Layer 3: Network Decapsulation
+            let src = ascii.charAt(0);
+            let dst = ascii.charAt(1);
+            let payload = ascii.substring(2);
+            
+            logConsole(`<b>DECODED PACKET:</b><br>[SRC: Node ${src}] [DST: Node ${dst}]<br><b>PAYLOAD: ${payload}</b>`);
+        }
+
+        function stopListening() {
+            clearInterval(rxInterval);
+            if(microphone) microphone.disconnect();
+            document.getElementById('rx-status').innerText = "Status: Idle";
+        }
+
+        function logConsole(msg) {
+            const cons = document.getElementById('rx-console');
+            cons.innerHTML += msg + "<br>";
+            cons.scrollTop = cons.scrollHeight;
+        }
+    </script>
+</body>
+</html>
