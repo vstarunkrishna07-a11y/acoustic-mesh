@@ -45,7 +45,7 @@
         const FREQ_SYNC = 3000; 
         const FREQ_1    = 2000; 
         const FREQ_0    = 1000; 
-        const BIT_TIME  = 300; // 300ms sweet spot for mobile CPUs
+        const BIT_TIME  = 250; // Stable 250ms interval
 
         let audioCtx;
 
@@ -55,7 +55,7 @@
         async function transmitPacket() {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             
-            // Pad text to exactly 5 chars so packet length is strictly 56 bits for demo stability
+            // Pad text to exactly 5 chars so packet length is strictly 56 bits
             let text = document.getElementById('payload').value;
             text = text.padEnd(5, ' ').substring(0, 5);
             
@@ -84,16 +84,12 @@
                 currentTime += BIT_TIME / 1000;
             }
 
-            // 3. Postamble (Stop Tone)
-            osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
-            currentTime += (BIT_TIME * 2) / 1000;
-
             osc.start();
             osc.stop(currentTime);
         }
 
         // ========================================================
-        // RECEIVER: DEMODULATION & TIMING LOCK
+        // RECEIVER: DEMODULATION & STRICT TIMING LOCK
         // ========================================================
         let analyser, microphone, rxInterval;
         let receivedBits = "";
@@ -105,7 +101,6 @@
             document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
             
             try {
-                // Disable mobile audio filters
                 const stream = await navigator.mediaDevices.getUserMedia({ 
                     audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } 
                 });
@@ -119,7 +114,6 @@
                 const dataArray = new Uint8Array(bufferLength);
                 const sampleRate = audioCtx.sampleRate; 
                 
-                // Fast poll (50ms) to catch frequencies instantly
                 rxInterval = setInterval(() => {
                     analyser.getByteFrequencyData(dataArray);
                     
@@ -132,7 +126,7 @@
                     const dominantFreq = maxIndex * sampleRate / analyser.fftSize;
                     if (maxVol > 150) handleFrequency(dominantFreq);
                     
-                }, 50); 
+                }, 40); 
 
             } catch (err) {
                 alert("Microphone error.");
@@ -151,16 +145,15 @@
                 document.getElementById('rx-status').innerText = "Status: Locked! Receiving Data... 🔴";
                 logConsole("--- Carrier Detected ---");
                 
-                // Wait for the 3-bit preamble to finish before reading data
                 setTimeout(() => { 
                     recordingState = "RECEIVING"; 
-                    lastBitTime = Date.now() - BIT_TIME; // Allow the first bit to read instantly
+                    lastBitTime = Date.now() - BIT_TIME; 
                 }, BIT_TIME * 2.5);
             } 
             else if (recordingState === "RECEIVING") {
                 
-                // TIMING LOCK: Only read a bit if ~1 full BIT_TIME has passed since the last one
-                if ((isOne || isZero) && (now - lastBitTime > (BIT_TIME * 0.8))) {
+                // TIMING LOCK
+                if ((isOne || isZero) && (now - lastBitTime > (BIT_TIME * 0.75))) {
                     if (isOne) {
                         receivedBits += "1";
                         logConsole("Bit: 1");
@@ -168,11 +161,11 @@
                         receivedBits += "0";
                         logConsole("Bit: 0");
                     }
-                    lastBitTime = now; // Lock out the next read until time passes
+                    lastBitTime = now;
                 }
                 
-                // Stop Condition: Hit 56 bits (7 chars * 8 bits) OR heard the Postamble Stop Tone
-                if (receivedBits.length >= 56 || (isSync && receivedBits.length > 16)) {
+                // STRICT STOP CONDITION: Only stop when exactly 56 bits are collected.
+                if (receivedBits.length >= 56) {
                     processPacket(receivedBits.substring(0, 56));
                     recordingState = "IDLE";
                     document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
@@ -185,11 +178,9 @@
             let ascii = "";
             for (let i = 0; i < bits.length; i += 8) {
                 let byte = bits.substring(i, i + 8);
-                // Ensure byte is 8 bits long before parsing
                 if(byte.length === 8) ascii += String.fromCharCode(parseInt(byte, 2));
             }
             
-            // Decapsulation
             let src = ascii.charAt(0);
             let dst = ascii.charAt(1);
             let payload = ascii.substring(2);
