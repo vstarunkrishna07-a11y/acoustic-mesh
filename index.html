@@ -13,13 +13,13 @@
         button:hover { background-color: #2ea043; }
         button.stop { background-color: #da3633; }
         input { width: 80%; padding: 10px; margin-bottom: 10px; background: #010409; color: #00ff9d; border: 1px solid #30363d; font-family: monospace; font-size: 16px;}
-        #rx-console { background: #010409; color: #00ff9d; height: 150px; overflow-y: auto; text-align: left; padding: 10px; border: 1px solid #30363d; margin-top: 10px; }
+        #rx-console { background: #010409; color: #00ff9d; height: 180px; overflow-y: auto; text-align: left; padding: 10px; border: 1px solid #30363d; margin-top: 10px; }
     </style>
 </head>
 <body>
 
     <h1>🔊 Acoustic-Mesh Modem</h1>
-    <p>Layer 1-3 Air-Gapped Audio Network (Audible FSK)</p>
+    <p>Self-Clocking Air-Gapped Audio Network</p>
 
     <div class="container">
         <!-- SENDER PANEL -->
@@ -34,7 +34,7 @@
         <div class="panel">
             <h2 style="color: #79c0ff;">🎧 Receiver Mode (Node B)</h2>
             <button id="btn-listen" onclick="startListening()">Start Listening</button>
-            <button class="stop" onclick="stopListening()">Stop</button>
+            <button class="stop" onclick="stopListening()">Stop / Reset</button>
             <div id="rx-status" style="margin-top:10px; color: yellow;">Status: Idle</div>
             <div id="rx-console">Waiting for audio packets...<br></div>
         </div>
@@ -45,21 +45,17 @@
         const FREQ_SYNC = 3000; 
         const FREQ_1    = 2000; 
         const FREQ_0    = 1000; 
-        const BIT_TIME  = 250; // Stable 250ms interval
 
         let audioCtx;
 
         // ========================================================
-        // SENDER: MODULATION
+        // SENDER: MODULATION (Self-Clocking)
         // ========================================================
         async function transmitPacket() {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             
-            // Pad text to exactly 5 chars so packet length is strictly 56 bits
             let text = document.getElementById('payload').value;
-            text = text.padEnd(5, ' ').substring(0, 5);
-            
-            // Layer 3: Network Encapsulation
+            text = text.padEnd(5, ' ').substring(0, 5); // Force 5 chars
             const packet = `12${text}`; 
             
             let binaryString = "";
@@ -73,15 +69,21 @@
             
             let currentTime = audioCtx.currentTime;
             
-            // 1. Preamble (Sync Tone)
+            // 1. Initial Wakeup Preamble
             osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
-            currentTime += (BIT_TIME * 3) / 1000;
+            currentTime += 0.4; // 400ms
 
-            // 2. Data (FSK)
+            // 2. Weave Clock Syncs between every Data Bit
             for (let i = 0; i < binaryString.length; i++) {
                 const freq = (binaryString[i] === '1') ? FREQ_1 : FREQ_0;
+                
+                // Play Data Bit
                 osc.frequency.setValueAtTime(freq, currentTime);
-                currentTime += BIT_TIME / 1000;
+                currentTime += 0.15; // 150ms
+                
+                // Play Clock Sync to reset receiver state
+                osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
+                currentTime += 0.10; // 100ms
             }
 
             osc.start();
@@ -89,16 +91,17 @@
         }
 
         // ========================================================
-        // RECEIVER: DEMODULATION & STRICT TIMING LOCK
+        // RECEIVER: STATE MACHINE DEMODULATION
         // ========================================================
         let analyser, microphone, rxInterval;
         let receivedBits = "";
-        let recordingState = "IDLE"; 
-        let lastBitTime = 0;
+        let recordingState = "WAIT_SYNC"; 
 
         async function startListening() {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
+            receivedBits = "";
+            recordingState = "WAIT_SYNC";
             
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ 
@@ -124,9 +127,11 @@
                     }
                     
                     const dominantFreq = maxIndex * sampleRate / analyser.fftSize;
-                    if (maxVol > 150) handleFrequency(dominantFreq);
                     
-                }, 40); 
+                    // Volume Threshold (180 cuts out room noise)
+                    if (maxVol > 180) handleFrequency(dominantFreq);
+                    
+                }, 30); // Poll very fast (30ms) to catch state changes instantly
 
             } catch (err) {
                 alert("Microphone error.");
@@ -134,47 +139,46 @@
         }
 
         function handleFrequency(freq) {
-            const isSync = Math.abs(freq - FREQ_SYNC) < 250;
-            const isOne  = Math.abs(freq - FREQ_1) < 250;
-            const isZero = Math.abs(freq - FREQ_0) < 250;
-            let now = Date.now();
+            const isSync = Math.abs(freq - FREQ_SYNC) < 300;
+            const isOne  = Math.abs(freq - FREQ_1) < 300;
+            const isZero = Math.abs(freq - FREQ_0) < 300;
 
-            if (recordingState === "IDLE" && isSync) {
-                recordingState = "SYNC";
-                receivedBits = "";
-                document.getElementById('rx-status').innerText = "Status: Locked! Receiving Data... 🔴";
-                logConsole("--- Carrier Detected ---");
-                
-                setTimeout(() => { 
-                    recordingState = "RECEIVING"; 
-                    lastBitTime = Date.now() - BIT_TIME; 
-                }, BIT_TIME * 2.5);
-            } 
-            else if (recordingState === "RECEIVING") {
-                
-                // TIMING LOCK
-                if ((isOne || isZero) && (now - lastBitTime > (BIT_TIME * 0.75))) {
-                    if (isOne) {
-                        receivedBits += "1";
-                        logConsole("Bit: 1");
-                    } else {
-                        receivedBits += "0";
-                        logConsole("Bit: 0");
+            // STATE 1: Waiting for the 3000Hz Clock Tone
+            if (recordingState === "WAIT_SYNC") {
+                if (isSync) {
+                    recordingState = "READ_BIT"; // Clock detected, unlock the data reader
+                    if (receivedBits.length === 0) {
+                        logConsole("<br>--- Incoming Packet Detected ---");
+                        document.getElementById('rx-status').innerText = "Status: Receiving Data... 🔴";
                     }
-                    lastBitTime = now;
                 }
-                
-                // STRICT STOP CONDITION: Only stop when exactly 56 bits are collected.
-                if (receivedBits.length >= 56) {
-                    processPacket(receivedBits.substring(0, 56));
-                    recordingState = "IDLE";
-                    document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
+            } 
+            // STATE 2: Waiting for a Data Bit (1000Hz or 2000Hz)
+            else if (recordingState === "READ_BIT") {
+                if (isOne) {
+                    receivedBits += "1";
+                    logConsole(`Bit ${receivedBits.length}/56 : 1`);
+                    recordingState = "WAIT_SYNC"; // Lock until next clock tone
+                    checkEnd();
+                } else if (isZero) {
+                    receivedBits += "0";
+                    logConsole(`Bit ${receivedBits.length}/56 : 0`);
+                    recordingState = "WAIT_SYNC"; // Lock until next clock tone
+                    checkEnd();
                 }
             }
         }
 
+        function checkEnd() {
+            if (receivedBits.length >= 56) {
+                processPacket(receivedBits);
+                receivedBits = "";
+                recordingState = "WAIT_SYNC";
+                document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
+            }
+        }
+
         function processPacket(bits) {
-            logConsole("Raw bits: " + bits);
             let ascii = "";
             for (let i = 0; i < bits.length; i += 8) {
                 let byte = bits.substring(i, i + 8);
@@ -185,13 +189,14 @@
             let dst = ascii.charAt(1);
             let payload = ascii.substring(2);
             
-            logConsole(`<br><b>DECODED PACKET:</b><br>[SRC: Node ${src}] [DST: Node ${dst}]<br><b>PAYLOAD: ${payload}</b><br>`);
+            logConsole(`<br><b>✅ DECODED PACKET:</b><br>[SRC: Node ${src}] [DST: Node ${dst}]<br><b>PAYLOAD: <span style="color:white; font-size:20px;">${payload}</span></b><br>`);
         }
 
         function stopListening() {
             clearInterval(rxInterval);
             if(microphone) microphone.disconnect();
             document.getElementById('rx-status').innerText = "Status: Idle";
+            receivedBits = "";
         }
 
         function logConsole(msg) {
