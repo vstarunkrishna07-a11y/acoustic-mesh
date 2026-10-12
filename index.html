@@ -12,20 +12,21 @@
         button { background-color: #238636; color: white; border: none; padding: 15px 20px; font-size: 16px; font-weight: bold; cursor: pointer; border-radius: 5px; margin: 5px; }
         button:hover { background-color: #2ea043; }
         button.stop { background-color: #da3633; }
-        input { width: 80%; padding: 10px; margin-bottom: 10px; background: #010409; color: #00ff9d; border: 1px solid #30363d; font-family: monospace; font-size: 16px;}
-        #rx-console { background: #010409; color: #00ff9d; height: 180px; overflow-y: auto; text-align: left; padding: 10px; border: 1px solid #30363d; margin-top: 10px; }
+        input { width: 90%; padding: 10px; margin-bottom: 10px; background: #010409; color: #00ff9d; border: 1px solid #30363d; font-family: monospace; font-size: 16px;}
+        #rx-console { background: #010409; color: #00ff9d; height: 200px; overflow-y: auto; text-align: left; padding: 10px; border: 1px solid #30363d; margin-top: 10px; }
     </style>
 </head>
 <body>
 
     <h1>🔊 Acoustic-Mesh Modem</h1>
-    <p>Self-Clocking Air-Gapped Audio Network</p>
+    <p>Dynamic Length Self-Clocking Audio Network</p>
 
     <div class="container">
         <!-- SENDER PANEL -->
         <div class="panel">
             <h2 style="color: #ff7b72;">📡 Sender Mode (Node A)</h2>
-            <input type="text" id="payload" value="HELLO" maxlength="5" placeholder="Enter exactly 5 chars">
+            <!-- Removed maxlength. You can type as much as you want! -->
+            <input type="text" id="payload" value="HELLO WORLD" placeholder="Enter text of any length">
             <br>
             <button onclick="transmitPacket()">Transmit Data</button>
         </div>
@@ -55,8 +56,9 @@
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             
             let text = document.getElementById('payload').value;
-            text = text.padEnd(5, ' ').substring(0, 5); 
-            const packet = `12${text}`; 
+            
+            // Layer 2/3: Add SRC(1), DST(2), Payload, and EOF Marker (#)
+            const packet = `12${text}#`; 
             
             let binaryString = "";
             for (let i = 0; i < packet.length; i++) {
@@ -77,16 +79,14 @@
             for (let i = 0; i < binaryString.length; i++) {
                 const freq = (binaryString[i] === '1') ? FREQ_1 : FREQ_0;
                 
-                // Play Data Bit (Slightly slower for reliability)
                 osc.frequency.setValueAtTime(freq, currentTime);
                 currentTime += 0.20; 
                 
-                // Play Clock Sync 
                 osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
                 currentTime += 0.15; 
             }
 
-            // 3. Postamble (Keep microphone awake to catch the last bit)
+            // 3. Postamble Wake-Lock
             osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
             currentTime += 0.6; 
 
@@ -95,7 +95,7 @@
         }
 
         // ========================================================
-        // RECEIVER: DEMODULATION & WATCHDOG TIMER
+        // RECEIVER: DEMODULATION & DYNAMIC FRAMING
         // ========================================================
         let analyser, microphone, rxInterval, watchdogInterval;
         let receivedBits = "";
@@ -123,16 +123,16 @@
                 const dataArray = new Uint8Array(bufferLength);
                 const sampleRate = audioCtx.sampleRate; 
                 
-                // 1. Network Watchdog Timer (Failsafe)
+                // 1. CSMA/CD Idle Watchdog (Failsafe End of Packet)
                 if (watchdogInterval) clearInterval(watchdogInterval);
                 watchdogInterval = setInterval(() => {
-                    if (receivedBits.length > 0 && receivedBits.length < 56) {
-                        if (Date.now() - lastBitReceivedTime > 2000) { // 2 seconds without a bit
-                            logConsole(`<br>⚠️ [TIMEOUT] Missing ${56 - receivedBits.length} bits. Forcing Decode...`);
+                    if (receivedBits.length > 0) {
+                        if (Date.now() - lastBitReceivedTime > 2000) { 
+                            logConsole(`<br>⚠️ [CHANNEL IDLE] End of stream detected. Forcing Decode...`);
                             
-                            // Pad with zeros to prevent a crash, then force evaluate
-                            let paddedBits = receivedBits.padEnd(56, '0');
-                            processPacket(paddedBits);
+                            // Discard incomplete bytes
+                            let validLength = Math.floor(receivedBits.length / 8) * 8;
+                            processPacket(receivedBits.substring(0, validLength));
                             
                             receivedBits = "";
                             recordingState = "WAIT_SYNC";
@@ -153,7 +153,6 @@
                     
                     const dominantFreq = maxIndex * sampleRate / analyser.fftSize;
                     
-                    // Lowered volume threshold to 130 to catch tail-end dropping frequencies
                     if (maxVol > 130) handleFrequency(dominantFreq);
                     
                 }, 30); 
@@ -180,14 +179,14 @@
             else if (recordingState === "READ_BIT") {
                 if (isOne) {
                     receivedBits += "1";
-                    logConsole(`Bit ${receivedBits.length}/56 : 1`);
-                    lastBitReceivedTime = Date.now(); // Reset Watchdog
+                    logConsole(`Bit ${receivedBits.length} : 1`);
+                    lastBitReceivedTime = Date.now(); 
                     recordingState = "WAIT_SYNC"; 
                     checkEnd();
                 } else if (isZero) {
                     receivedBits += "0";
-                    logConsole(`Bit ${receivedBits.length}/56 : 0`);
-                    lastBitReceivedTime = Date.now(); // Reset Watchdog
+                    logConsole(`Bit ${receivedBits.length} : 0`);
+                    lastBitReceivedTime = Date.now(); 
                     recordingState = "WAIT_SYNC"; 
                     checkEnd();
                 }
@@ -195,11 +194,19 @@
         }
 
         function checkEnd() {
-            if (receivedBits.length >= 56) {
-                processPacket(receivedBits);
-                receivedBits = "";
-                recordingState = "WAIT_SYNC";
-                document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
+            // Check if we just completed a full byte (8 bits)
+            if (receivedBits.length > 0 && receivedBits.length % 8 === 0) {
+                let lastByte = receivedBits.slice(-8);
+                // "00100011" is the binary for the '#' symbol (End Of Frame)
+                if (lastByte === "00100011") {
+                    // Remove the '#' byte before processing the payload
+                    let validPayloadBits = receivedBits.slice(0, -8);
+                    processPacket(validPayloadBits);
+                    
+                    receivedBits = "";
+                    recordingState = "WAIT_SYNC";
+                    document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
+                }
             }
         }
 
