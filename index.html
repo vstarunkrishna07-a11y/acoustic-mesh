@@ -14,8 +14,6 @@
         button.stop { background-color: #da3633; }
         input { width: 80%; padding: 10px; margin-bottom: 10px; background: #010409; color: #00ff9d; border: 1px solid #30363d; font-family: monospace; font-size: 16px;}
         #rx-console { background: #010409; color: #00ff9d; height: 150px; overflow-y: auto; text-align: left; padding: 10px; border: 1px solid #30363d; margin-top: 10px; }
-        .blink { animation: blinker 1s linear infinite; }
-        @keyframes blinker { 50% { opacity: 0; } }
     </style>
 </head>
 <body>
@@ -27,7 +25,7 @@
         <!-- SENDER PANEL -->
         <div class="panel">
             <h2 style="color: #ff7b72;">📡 Sender Mode (Node A)</h2>
-            <input type="text" id="payload" value="HELLO" maxlength="10" placeholder="Enter short text (max 10 chars)">
+            <input type="text" id="payload" value="HELLO" maxlength="5" placeholder="Enter exactly 5 chars">
             <br>
             <button onclick="transmitPacket()">Transmit Data</button>
         </div>
@@ -43,122 +41,109 @@
     </div>
 
     <script>
-        // --- ACOUSTIC PROTOCOL CONSTANTS (Audible Range) ---
-        const FREQ_SYNC = 3000; // Preamble/Sync Tone (3 kHz)
-        const FREQ_1    = 2000; // Bit 1 (2 kHz)
-        const FREQ_0    = 1000; // Bit 0 (1 kHz)
-        const BIT_TIME  = 400;  // Duration of each bit in milliseconds (Slow for reliability)
+        // --- ACOUSTIC PROTOCOL CONSTANTS ---
+        const FREQ_SYNC = 3000; 
+        const FREQ_1    = 2000; 
+        const FREQ_0    = 1000; 
+        const BIT_TIME  = 300; // 300ms sweet spot for mobile CPUs
 
         let audioCtx;
 
         // ========================================================
-        // SENDER: MODULATION & OSI ENCAPSULATION
+        // SENDER: MODULATION
         // ========================================================
         async function transmitPacket() {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            const text = document.getElementById('payload').value;
             
-            // Layer 3: Network Encapsulation [SRC=1, DST=2, PAYLOAD]
+            // Pad text to exactly 5 chars so packet length is strictly 56 bits for demo stability
+            let text = document.getElementById('payload').value;
+            text = text.padEnd(5, ' ').substring(0, 5);
+            
+            // Layer 3: Network Encapsulation
             const packet = `12${text}`; 
             
-            // Layer 2: Framing (Convert to binary string)
             let binaryString = "";
             for (let i = 0; i < packet.length; i++) {
-                let bin = packet.charCodeAt(i).toString(2).padStart(8, '0');
-                binaryString += bin;
+                binaryString += packet.charCodeAt(i).toString(2).padStart(8, '0');
             }
 
-            console.log("Transmitting Baseband Binary:", binaryString);
-
-            // Layer 1: Physical FSK Modulation
             const osc = audioCtx.createOscillator();
-            osc.type = 'sine'; // Pure tone
+            osc.type = 'sine';
             osc.connect(audioCtx.destination);
             
             let currentTime = audioCtx.currentTime;
             
-            // 1. Send Preamble/Sync (Hold for 3x bit time to wake up receiver)
+            // 1. Preamble (Sync Tone)
             osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
             currentTime += (BIT_TIME * 3) / 1000;
 
-            // 2. Modulate Data (FSK)
+            // 2. Data (FSK)
             for (let i = 0; i < binaryString.length; i++) {
-                const bit = binaryString[i];
-                const freq = (bit === '1') ? FREQ_1 : FREQ_0;
+                const freq = (binaryString[i] === '1') ? FREQ_1 : FREQ_0;
                 osc.frequency.setValueAtTime(freq, currentTime);
                 currentTime += BIT_TIME / 1000;
             }
 
-            // 3. Stop transmission
+            // 3. Postamble (Stop Tone)
+            osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
+            currentTime += (BIT_TIME * 2) / 1000;
+
             osc.start();
             osc.stop(currentTime);
         }
 
         // ========================================================
-        // RECEIVER: DEMODULATION & DSP (Fast Fourier Transform)
+        // RECEIVER: DEMODULATION & TIMING LOCK
         // ========================================================
         let analyser, microphone, rxInterval;
-        let isReceiving = false;
         let receivedBits = "";
-        let recordingState = "IDLE"; // IDLE -> SYNC -> RECEIVING
+        let recordingState = "IDLE"; 
+        let lastBitTime = 0;
 
         async function startListening() {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
             
             try {
-                // Request Microphone access WITH NOISE SUPPRESSION DISABLED
+                // Disable mobile audio filters
                 const stream = await navigator.mediaDevices.getUserMedia({ 
-                    audio: { 
-                        echoCancellation: false, 
-                        noiseSuppression: false, 
-                        autoGainControl: false 
-                    } 
+                    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } 
                 });
                 
                 microphone = audioCtx.createMediaStreamSource(stream);
                 analyser = audioCtx.createAnalyser();
-                
-                // FFT Setup
                 analyser.fftSize = 2048; 
                 microphone.connect(analyser);
                 
                 const bufferLength = analyser.frequencyBinCount;
                 const dataArray = new Uint8Array(bufferLength);
-                const sampleRate = audioCtx.sampleRate; // usually 44100 or 48000
+                const sampleRate = audioCtx.sampleRate; 
                 
-                // DSP Polling Loop
+                // Fast poll (50ms) to catch frequencies instantly
                 rxInterval = setInterval(() => {
                     analyser.getByteFrequencyData(dataArray);
                     
-                    // Find Dominant Frequency
                     let maxIndex = 0;
                     let maxVol = 0;
                     for(let i = 0; i < bufferLength; i++) {
-                        if(dataArray[i] > maxVol) {
-                            maxVol = dataArray[i];
-                            maxIndex = i;
-                        }
+                        if(dataArray[i] > maxVol) { maxVol = dataArray[i]; maxIndex = i; }
                     }
                     
                     const dominantFreq = maxIndex * sampleRate / analyser.fftSize;
+                    if (maxVol > 150) handleFrequency(dominantFreq);
                     
-                    // Simple threshold logic for Web Demo
-                    if (maxVol > 150) { 
-                        handleFrequency(dominantFreq);
-                    }
-                }, BIT_TIME / 2); // Oversample for better accuracy
+                }, 50); 
 
             } catch (err) {
-                alert("Microphone access denied or not available. (Use HTTPS or localhost)");
+                alert("Microphone error.");
             }
         }
 
         function handleFrequency(freq) {
-            // Frequency tolerance window (+/- 200 Hz)
-            const isSync = Math.abs(freq - FREQ_SYNC) < 200;
-            const isOne  = Math.abs(freq - FREQ_1) < 200;
-            const isZero = Math.abs(freq - FREQ_0) < 200;
+            const isSync = Math.abs(freq - FREQ_SYNC) < 250;
+            const isOne  = Math.abs(freq - FREQ_1) < 250;
+            const isZero = Math.abs(freq - FREQ_0) < 250;
+            let now = Date.now();
 
             if (recordingState === "IDLE" && isSync) {
                 recordingState = "SYNC";
@@ -166,21 +151,29 @@
                 document.getElementById('rx-status').innerText = "Status: Locked! Receiving Data... 🔴";
                 logConsole("--- Carrier Detected ---");
                 
-                // Wait for sync tone to finish before reading bits
-                setTimeout(() => { recordingState = "RECEIVING"; }, BIT_TIME * 2);
+                // Wait for the 3-bit preamble to finish before reading data
+                setTimeout(() => { 
+                    recordingState = "RECEIVING"; 
+                    lastBitTime = Date.now() - BIT_TIME; // Allow the first bit to read instantly
+                }, BIT_TIME * 2.5);
             } 
             else if (recordingState === "RECEIVING") {
-                if (isOne && !receivedBits.endsWith("1_temp")) {
-                    receivedBits += "1";
-                    logConsole("Bit received: 1");
-                } else if (isZero && !receivedBits.endsWith("0_temp")) {
-                    receivedBits += "0";
-                    logConsole("Bit received: 0");
+                
+                // TIMING LOCK: Only read a bit if ~1 full BIT_TIME has passed since the last one
+                if ((isOne || isZero) && (now - lastBitTime > (BIT_TIME * 0.8))) {
+                    if (isOne) {
+                        receivedBits += "1";
+                        logConsole("Bit: 1");
+                    } else {
+                        receivedBits += "0";
+                        logConsole("Bit: 0");
+                    }
+                    lastBitTime = now; // Lock out the next read until time passes
                 }
                 
-                // Assuming standard demo payload size (2 headers + 5 chars) * 8 bits = 56 bits
-                if (receivedBits.length >= 56) {
-                    processPacket(receivedBits);
+                // Stop Condition: Hit 56 bits (7 chars * 8 bits) OR heard the Postamble Stop Tone
+                if (receivedBits.length >= 56 || (isSync && receivedBits.length > 16)) {
+                    processPacket(receivedBits.substring(0, 56));
                     recordingState = "IDLE";
                     document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
                 }
@@ -188,19 +181,20 @@
         }
 
         function processPacket(bits) {
-            logConsole("Raw bits: " + bits.substring(0, 56));
+            logConsole("Raw bits: " + bits);
             let ascii = "";
-            for (let i = 0; i < 56; i += 8) {
+            for (let i = 0; i < bits.length; i += 8) {
                 let byte = bits.substring(i, i + 8);
-                ascii += String.fromCharCode(parseInt(byte, 2));
+                // Ensure byte is 8 bits long before parsing
+                if(byte.length === 8) ascii += String.fromCharCode(parseInt(byte, 2));
             }
             
-            // Layer 3: Network Decapsulation
+            // Decapsulation
             let src = ascii.charAt(0);
             let dst = ascii.charAt(1);
             let payload = ascii.substring(2);
             
-            logConsole(`<b>DECODED PACKET:</b><br>[SRC: Node ${src}] [DST: Node ${dst}]<br><b>PAYLOAD: ${payload}</b>`);
+            logConsole(`<br><b>DECODED PACKET:</b><br>[SRC: Node ${src}] [DST: Node ${dst}]<br><b>PAYLOAD: ${payload}</b><br>`);
         }
 
         function stopListening() {
