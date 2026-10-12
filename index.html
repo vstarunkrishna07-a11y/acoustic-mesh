@@ -49,13 +49,13 @@
         let audioCtx;
 
         // ========================================================
-        // SENDER: MODULATION (Self-Clocking)
+        // SENDER: MODULATION
         // ========================================================
         async function transmitPacket() {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             
             let text = document.getElementById('payload').value;
-            text = text.padEnd(5, ' ').substring(0, 5); // Force 5 chars
+            text = text.padEnd(5, ' ').substring(0, 5); 
             const packet = `12${text}`; 
             
             let binaryString = "";
@@ -71,37 +71,43 @@
             
             // 1. Initial Wakeup Preamble
             osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
-            currentTime += 0.4; // 400ms
+            currentTime += 0.4; 
 
-            // 2. Weave Clock Syncs between every Data Bit
+            // 2. Weave Clock Syncs between Data Bits
             for (let i = 0; i < binaryString.length; i++) {
                 const freq = (binaryString[i] === '1') ? FREQ_1 : FREQ_0;
                 
-                // Play Data Bit
+                // Play Data Bit (Slightly slower for reliability)
                 osc.frequency.setValueAtTime(freq, currentTime);
-                currentTime += 0.15; // 150ms
+                currentTime += 0.20; 
                 
-                // Play Clock Sync to reset receiver state
+                // Play Clock Sync 
                 osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
-                currentTime += 0.10; // 100ms
+                currentTime += 0.15; 
             }
+
+            // 3. Postamble (Keep microphone awake to catch the last bit)
+            osc.frequency.setValueAtTime(FREQ_SYNC, currentTime);
+            currentTime += 0.6; 
 
             osc.start();
             osc.stop(currentTime);
         }
 
         // ========================================================
-        // RECEIVER: STATE MACHINE DEMODULATION
+        // RECEIVER: DEMODULATION & WATCHDOG TIMER
         // ========================================================
-        let analyser, microphone, rxInterval;
+        let analyser, microphone, rxInterval, watchdogInterval;
         let receivedBits = "";
         let recordingState = "WAIT_SYNC"; 
+        let lastBitReceivedTime = 0;
 
         async function startListening() {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
             receivedBits = "";
             recordingState = "WAIT_SYNC";
+            lastBitReceivedTime = Date.now();
             
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ 
@@ -117,6 +123,25 @@
                 const dataArray = new Uint8Array(bufferLength);
                 const sampleRate = audioCtx.sampleRate; 
                 
+                // 1. Network Watchdog Timer (Failsafe)
+                if (watchdogInterval) clearInterval(watchdogInterval);
+                watchdogInterval = setInterval(() => {
+                    if (receivedBits.length > 0 && receivedBits.length < 56) {
+                        if (Date.now() - lastBitReceivedTime > 2000) { // 2 seconds without a bit
+                            logConsole(`<br>⚠️ [TIMEOUT] Missing ${56 - receivedBits.length} bits. Forcing Decode...`);
+                            
+                            // Pad with zeros to prevent a crash, then force evaluate
+                            let paddedBits = receivedBits.padEnd(56, '0');
+                            processPacket(paddedBits);
+                            
+                            receivedBits = "";
+                            recordingState = "WAIT_SYNC";
+                            document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
+                        }
+                    }
+                }, 1000);
+
+                // 2. Data Polling Loop
                 rxInterval = setInterval(() => {
                     analyser.getByteFrequencyData(dataArray);
                     
@@ -128,10 +153,10 @@
                     
                     const dominantFreq = maxIndex * sampleRate / analyser.fftSize;
                     
-                    // Volume Threshold (180 cuts out room noise)
-                    if (maxVol > 180) handleFrequency(dominantFreq);
+                    // Lowered volume threshold to 130 to catch tail-end dropping frequencies
+                    if (maxVol > 130) handleFrequency(dominantFreq);
                     
-                }, 30); // Poll very fast (30ms) to catch state changes instantly
+                }, 30); 
 
             } catch (err) {
                 alert("Microphone error.");
@@ -143,27 +168,27 @@
             const isOne  = Math.abs(freq - FREQ_1) < 300;
             const isZero = Math.abs(freq - FREQ_0) < 300;
 
-            // STATE 1: Waiting for the 3000Hz Clock Tone
             if (recordingState === "WAIT_SYNC") {
                 if (isSync) {
-                    recordingState = "READ_BIT"; // Clock detected, unlock the data reader
+                    recordingState = "READ_BIT"; 
                     if (receivedBits.length === 0) {
                         logConsole("<br>--- Incoming Packet Detected ---");
                         document.getElementById('rx-status').innerText = "Status: Receiving Data... 🔴";
                     }
                 }
             } 
-            // STATE 2: Waiting for a Data Bit (1000Hz or 2000Hz)
             else if (recordingState === "READ_BIT") {
                 if (isOne) {
                     receivedBits += "1";
                     logConsole(`Bit ${receivedBits.length}/56 : 1`);
-                    recordingState = "WAIT_SYNC"; // Lock until next clock tone
+                    lastBitReceivedTime = Date.now(); // Reset Watchdog
+                    recordingState = "WAIT_SYNC"; 
                     checkEnd();
                 } else if (isZero) {
                     receivedBits += "0";
                     logConsole(`Bit ${receivedBits.length}/56 : 0`);
-                    recordingState = "WAIT_SYNC"; // Lock until next clock tone
+                    lastBitReceivedTime = Date.now(); // Reset Watchdog
+                    recordingState = "WAIT_SYNC"; 
                     checkEnd();
                 }
             }
@@ -194,6 +219,7 @@
 
         function stopListening() {
             clearInterval(rxInterval);
+            if(watchdogInterval) clearInterval(watchdogInterval);
             if(microphone) microphone.disconnect();
             document.getElementById('rx-status').innerText = "Status: Idle";
             receivedBits = "";
