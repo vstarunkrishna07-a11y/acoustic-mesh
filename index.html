@@ -107,8 +107,15 @@
             document.getElementById('rx-status').innerText = "Status: Listening for Sync Tone... 🟢";
             
             try {
-                // Request Microphone access
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                // Request Microphone access WITH NOISE SUPPRESSION DISABLED
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        echoCancellation: false, 
+                        noiseSuppression: false, 
+                        autoGainControl: false 
+                    } 
+                });
+                
                 microphone = audioCtx.createMediaStreamSource(stream);
                 analyser = audioCtx.createAnalyser();
                 
@@ -172,7 +179,6 @@
                 }
                 
                 // Assuming standard demo payload size (2 headers + 5 chars) * 8 bits = 56 bits
-                // For a dynamic project, you'd implement a stop bit or length header
                 if (receivedBits.length >= 56) {
                     processPacket(receivedBits);
                     recordingState = "IDLE";
